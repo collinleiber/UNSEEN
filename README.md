@@ -1,2 +1,2 @@
 # UNSEEN
-Dying Clusters Is All You Need. Performing Deep Clustering With an Unknown Number of Clusters
+Dying Clusters Is All You Need - Deep Clustering With an Unknown Number of Clusters
