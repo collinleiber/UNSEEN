@@ -1,0 +1,5 @@
+numpy
+sklearn
+torch
+tqdm
+clustpy
