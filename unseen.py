@@ -112,12 +112,9 @@ def _UNSEEN(X: np.ndarray, n_clusters: int, dying_threshold: float, batch_size: 
         clustering_module = _UNSEEN_DEC_Module(init_centers, 1, augmentation_invariance).to(device)
     else:
         raise Exception("base_algorithm must be DCN, DKM or DEC")
-    # Use DCN optimizer parameters (usually learning rate is reduced by a magnitude of 10)
-    optimizer = optimizer_class(list(neural_network.parameters()) + list(clustering_module.parameters()),
-                                **clustering_optimizer_params)
-    # DEC Training loop
-    clustering_module.fit(neural_network, trainloader, testloader, clustering_epochs, device, optimizer, ssl_loss_fn,
-                          clustering_loss_weight, ssl_loss_weight, dying_threshold)
+    # Training loop
+    clustering_module.fit(neural_network, trainloader, testloader, clustering_epochs, device, ssl_loss_fn,
+                          clustering_loss_weight, ssl_loss_weight, dying_threshold, optimizer_class, clustering_optimizer_params)
     # Get labels
     clustering_labels = predict_batchwise(testloader, neural_network, clustering_module)
     clustering_centers = clustering_module.centers.detach().cpu().numpy()
@@ -192,9 +189,9 @@ class _UNSEEN_DEC_Module(_DEC_Module):
         return loss
 
     def fit(self, neural_network: torch.nn.Module, trainloader: torch.utils.data.DataLoader,
-            testloader: torch.utils.data.DataLoader, n_epochs: int,
-            device: torch.device, optimizer: torch.optim.Optimizer, ssl_loss_fn: torch.nn.modules.loss._Loss,
-            clustering_loss_weight: float, ssl_loss_weight: float, dying_threshold: float) -> '_UNSEEN_DEC_Module':
+            testloader: torch.utils.data.DataLoader, n_epochs: int, device: torch.device, ssl_loss_fn: torch.nn.modules.loss._Loss,
+            clustering_loss_weight: float, ssl_loss_weight: float, dying_threshold: float, optimizer_class: torch.optim.Optimizer, 
+            optimizer_params: dict) -> '_UNSEEN_DEC_Module':
         """
         Trains the _DEC_Module in place.
 
@@ -210,8 +207,6 @@ class _UNSEEN_DEC_Module(_DEC_Module):
             number of epochs for the clustering procedure
         device : torch.device
             device to be trained on
-        optimizer : torch.optim.Optimizer
-            the optimizer for training
         ssl_loss_fn : torch.nn.modules.loss._Loss
             self-supervised learning (ssl) loss function for training the network, e.g. reconstruction loss for autoencoders
         clustering_loss_weight : float
@@ -220,12 +215,17 @@ class _UNSEEN_DEC_Module(_DEC_Module):
             weight of the self-supervised learning (ssl) loss
         dying_threshold : float
             threshold for letting a cluster die
+        optimizer_class : torch.optim.Optimizer
+            the optimizer class
+        optimizer_params : dict
+            parameters of the optimizer, includes the learning rate
 
         Returns
         -------
         self : _UNSEEN_DEC_Module
             this instance of the _UNSEEN_DEC_Module
         """
+        optimizer = optimizer_class(list(neural_network.parameters()) + list(self.parameters()), **optimizer_params) 
         init_labels = torch.from_numpy(predict_batchwise(testloader, neural_network, self)).to(device)
         _, init_sizes = torch.unique(init_labels, return_counts=True)
         tbar = tqdm.trange(n_epochs, desc="DEC training")
@@ -270,7 +270,8 @@ class _UNSEEN_DEC_Module(_DEC_Module):
                                                                                              return_counts=True)[1])
                     assert torch.sum(init_sizes) == init_labels.shape[0], "size is wrong ({0})".format(
                         torch.sum(init_sizes))
-
+                    # Reinitialize Optimizer
+                    optimizer = optimizer_class(list(neural_network.parameters()) + list(self.parameters()), **optimizer_params) 
             postfix_str = {"Loss": total_loss, "n_clusters": len(self.centers)}
             tbar.set_postfix(postfix_str)
         return self
@@ -394,11 +395,13 @@ class UNSEEN_DEC(DEC):
         self : UNSEEN_DEC
             this instance of the UNSEEN_DEC algorithm
         """
+        ssl_loss_weight = self.ssl_loss_weight if hasattr(self, "ssl_loss_weight") else 0 # DEC does not use ssl loss when clustering
+        X, _, random_state, pretrain_optimizer_params, clustering_optimizer_params, initial_clustering_params = self._check_parameters(X, y=y) 
         kmeans_labels, kmeans_centers, dec_labels, dec_centers, neural_network = _UNSEEN(X, self.n_clusters,
                                                                                          self.dying_threshold,
                                                                                          self.batch_size,
-                                                                                         self.pretrain_optimizer_params,
-                                                                                         self.clustering_optimizer_params,
+                                                                                         pretrain_optimizer_params,
+                                                                                         clustering_optimizer_params,
                                                                                          self.pretrain_epochs,
                                                                                          self.clustering_epochs,
                                                                                          self.optimizer_class,
@@ -407,12 +410,12 @@ class UNSEEN_DEC(DEC):
                                                                                          self.neural_network_weights,
                                                                                          self.embedding_size,
                                                                                          self.clustering_loss_weight,
-                                                                                         self.ssl_loss_weight,
+                                                                                         ssl_loss_weight,
                                                                                          self.custom_dataloaders,
                                                                                          self.augmentation_invariance,
                                                                                          self.initial_clustering_class,
-                                                                                         self.initial_clustering_params,
-                                                                                         self.device, self.random_state,
+                                                                                         initial_clustering_params,
+                                                                                         self.device, random_state,
                                                                                          "DEC")
         self.labels_ = kmeans_labels
         self.cluster_centers_ = kmeans_centers
@@ -477,10 +480,9 @@ class _UNSEEN_DKM_Module(_DKM_Module):
         return loss
 
     def fit(self, neural_network: torch.nn.Module, trainloader: torch.utils.data.DataLoader,
-            testloader: torch.utils.data.DataLoader,
-            n_epochs: int, device: torch.device, optimizer: torch.optim.Optimizer,
-            ssl_loss_fn: torch.nn.modules.loss._Loss,
-            clustering_loss_weight: float, ssl_loss_weight: float, dying_threshold: float) -> '_UNSEEN_DKM_Module':
+            testloader: torch.utils.data.DataLoader, n_epochs: int, device: torch.device,
+            ssl_loss_fn: torch.nn.modules.loss._Loss, clustering_loss_weight: float, ssl_loss_weight: float, 
+            dying_threshold: float, optimizer_class: torch.optim.Optimizer, optimizer_params: dict) -> '_UNSEEN_DKM_Module':
         """
         Trains the _DKM_Module in place.
 
@@ -497,8 +499,6 @@ class _UNSEEN_DKM_Module(_DKM_Module):
             The total number of epochs therefore corresponds to: len(alphas)*n_epochs
         device : torch.device
             device to be trained on
-        optimizer : torch.optim.Optimizer
-            the optimizer for training
         ssl_loss_fn : torch.nn.modules.loss._Loss
             self-supervised learning (ssl) loss function for training the network, e.g. reconstruction loss for autoencoders
         clustering_loss_weight : float
@@ -507,12 +507,17 @@ class _UNSEEN_DKM_Module(_DKM_Module):
             weight of the self-supervised learning (ssl) loss
         dying_threshold : float
             threshold for letting a cluster die
+        optimizer_class : torch.optim.Optimizer
+            the optimizer class
+        optimizer_params : dict
+            parameters of the optimizer, includes the learning rate
 
         Returns
         -------
         self : _UNSEEN_DKM_Module
             this instance of the _UNSEEN_DKM_Module
         """
+        optimizer = optimizer_class(list(neural_network.parameters()) + list(self.parameters()), **optimizer_params) 
         init_labels = torch.from_numpy(predict_batchwise(testloader, neural_network, self)).to(device)
         _, init_sizes = torch.unique(init_labels, return_counts=True)
         tbar = tqdm.tqdm(total=n_epochs * len(self.alphas), desc="DKM training")
@@ -558,6 +563,8 @@ class _UNSEEN_DKM_Module(_DKM_Module):
                                                                                                  return_counts=True)[1])
                         assert torch.sum(init_sizes) == init_labels.shape[0], "size is wrong ({0})".format(
                             torch.sum(init_sizes))
+                    # Reinitialize Optimizer
+                    optimizer = optimizer_class(list(neural_network.parameters()) + list(self.parameters()), **optimizer_params) 
                 postfix_str = {"Loss": total_loss, "n_clusters": len(self.centers)}
                 tbar.set_postfix(postfix_str)
                 tbar.update()
@@ -689,11 +696,12 @@ class UNSEEN_DKM(DKM):
         self : DKM
             this instance of the DKM algorithm
         """
+        X, _, random_state, pretrain_optimizer_params, clustering_optimizer_params, initial_clustering_params = self._check_parameters(X, y=y) 
         kmeans_labels, kmeans_centers, dkm_labels, dkm_centers, neural_network = _UNSEEN(X, self.n_clusters,
                                                                                          self.dying_threshold,
                                                                                          self.batch_size,
-                                                                                         self.pretrain_optimizer_params,
-                                                                                         self.clustering_optimizer_params,
+                                                                                         pretrain_optimizer_params,
+                                                                                         clustering_optimizer_params,
                                                                                          self.pretrain_epochs,
                                                                                          self.clustering_epochs,
                                                                                          self.optimizer_class,
@@ -706,9 +714,9 @@ class UNSEEN_DKM(DKM):
                                                                                          self.custom_dataloaders,
                                                                                          self.augmentation_invariance,
                                                                                          self.initial_clustering_class,
-                                                                                         self.initial_clustering_params,
+                                                                                         initial_clustering_params,
                                                                                          self.device,
-                                                                                         self.random_state, "DKM")
+                                                                                         random_state, "DKM")
         self.labels_ = kmeans_labels
         self.cluster_centers_ = kmeans_centers
         self.dkm_labels_ = dkm_labels
@@ -774,9 +782,9 @@ class _UNSEEN_DCN_Module(_DCN_Module):
         return loss
 
     def fit(self, neural_network: torch.nn.Module, trainloader: torch.utils.data.DataLoader,
-            testloader: torch.utils.data.DataLoader, n_epochs: int, device: torch.device,
-            optimizer: torch.optim.Optimizer, ssl_loss_fn: torch.nn.modules.loss._Loss, clustering_loss_weight: float,
-            ssl_loss_weight: float, dying_threshold: float) -> '_UNSEEN_DCN_Module':
+            testloader: torch.utils.data.DataLoader, n_epochs: int, device: torch.device, ssl_loss_fn: torch.nn.modules.loss._Loss, 
+            clustering_loss_weight: float, ssl_loss_weight: float, dying_threshold: float, optimizer_class: torch.optim.Optimizer, 
+            optimizer_params: dict) -> '_UNSEEN_DCN_Module':
         """
         Trains the _DCN_Module in place.
 
@@ -792,8 +800,6 @@ class _UNSEEN_DCN_Module(_DCN_Module):
             number of epochs for the clustering procedure
         device : torch.device
             device to be trained on
-        optimizer : torch.optim.Optimizer
-            the optimizer for training
         ssl_loss_fn : torch.nn.modules.loss._Loss
             self-supervised learning (ssl) loss function for training the network, e.g. reconstruction loss for autoencoders
         clustering_loss_weight : float
@@ -802,12 +808,17 @@ class _UNSEEN_DCN_Module(_DCN_Module):
             weight of the self-supervised learning (ssl) loss
         dying_threshold : float
             threshold for letting a cluster die
+        optimizer_class : torch.optim.Optimizer
+            the optimizer class
+        optimizer_params : dict
+            parameters of the optimizer, includes the learning rate
 
         Returns
         -------
         self : _UNSEEN_DCN_Module
             this instance of the _UNSEEN_DCN_Module
         """
+        optimizer = optimizer_class(list(neural_network.parameters()), **optimizer_params) 
         # DCN training loop
         init_labels = self.labels.clone()
         _, init_sizes = torch.unique(self.labels, return_counts=True)
@@ -991,11 +1002,12 @@ class UNSEEN_DCN(DCN):
         self : UNSEEN_DCN
             this instance of the UNSEEN_DCN algorithm
         """
+        X, _, random_state, pretrain_optimizer_params, clustering_optimizer_params, initial_clustering_params = self._check_parameters(X, y=y) 
         kmeans_labels, kmeans_centers, dcn_labels, dcn_centers, neural_network = _UNSEEN(X, self.n_clusters,
                                                                                          self.dying_threshold,
                                                                                          self.batch_size,
-                                                                                         self.pretrain_optimizer_params,
-                                                                                         self.clustering_optimizer_params,
+                                                                                         pretrain_optimizer_params,
+                                                                                         clustering_optimizer_params,
                                                                                          self.pretrain_epochs,
                                                                                          self.clustering_epochs,
                                                                                          self.optimizer_class,
@@ -1008,9 +1020,9 @@ class UNSEEN_DCN(DCN):
                                                                                          self.custom_dataloaders,
                                                                                          self.augmentation_invariance,
                                                                                          self.initial_clustering_class,
-                                                                                         self.initial_clustering_params,
+                                                                                         initial_clustering_params,
                                                                                          self.device,
-                                                                                         self.random_state, "DCN")
+                                                                                         random_state, "DCN")
         self.labels_ = kmeans_labels
         self.cluster_centers_ = kmeans_centers
         self.dcn_labels_ = dcn_labels
@@ -1028,11 +1040,11 @@ from clustpy.utils import evaluate_multiple_datasets, EvaluationDataset, Evaluat
 from clustpy.metrics import unsupervised_clustering_accuracy as acc, fair_normalized_mutual_information as fnmi
 from sklearn.metrics import normalized_mutual_info_score as nmi, adjusted_rand_score as ari
 from sklearn.datasets import make_blobs
-from clustpy.deep import get_trained_network, get_dataloader
+from clustpy.deep import get_trained_network
 from clustpy.deep.neural_networks import FeedforwardAutoencoder
-from clustpy.deep._utils import embedded_kmeans_prediction
 from clustpy.data import load_mnist, load_optdigits, load_kmnist, load_usps, load_pendigits, load_fmnist
 from sklearn.utils import check_random_state
+from sklearn.metrics.pairwise import pairwise_distances_argmin_min
 
 EXPERIMENT_PATH = "PATH/UNSEEN/"
 
@@ -1059,9 +1071,11 @@ class AEKmeans():
         return self
 
     def predict(self, X: np.ndarray) -> np.ndarray:
-        dataloader = get_dataloader(X, self.batch_size, False, False)
         ae = self.neural_network.to(torch.device('cpu'))
-        predicted_labels = embedded_kmeans_prediction(dataloader, self.cluster_centers_, ae)
+        X_embed = ae.tansform(X)
+        predicted_labels = predicted_labels, _ = pairwise_distances_argmin_min(X=X_embed, Y=self.cluster_centers_, metric='euclidean',
+                                                        metric_kwargs={'squared': True})
+        predicted_labels = predicted_labels.astype(np.int32)
         return predicted_labels
 
 
